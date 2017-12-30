@@ -166,7 +166,7 @@ if __name__=="__main__":
             else:
                 count = count + 1
                 # to stop
-                if count > 10:
+                if count > 4:
                     x = 0
                     th = 0
                 if (key == '\x03'):

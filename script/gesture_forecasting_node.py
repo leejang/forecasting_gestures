@@ -2,15 +2,67 @@
 
 import os
 import sys
+import threading
 import rospy
 import cv2
+import numpy as np
+import time
 
-sys.path.insert(0, '/home/leejang/lib/ssd_caffe/caffe/python')
+#sys.path.insert(0, '/home/leejang/lib/ssd_caffe/caffe/python')
+
+caffe_root = '/home/leejang/lib/ssd_caffe/caffe'
+os.chdir(caffe_root)
+sys.path.insert(0, 'python')
+
 import caffe
 
+# for Caffe
+from google.protobuf import text_format
+from caffe.proto import caffe_pb2
+
+# for ROS
 from std_msgs.msg import String
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
+
+# for sound play
+from sound_play.msg import SoundRequest
+from sound_play.libsoundplay import SoundClient
+
+voice = 'voice_kal_diphone'
+volume = 1.0
+
+voiceBindings={
+        'come':'coming',
+        'go':'going',
+        'stop':'Okay. I will stop.',
+          }
+
+# load EgoFingers labels
+labelmap_file = '/home/leejang/lib/ssd_caffe/caffe/data/hdi_detection/labelmap_voc.prototxt'
+file = open(labelmap_file, 'r')
+labelmap = caffe_pb2.LabelMap()
+text_format.Merge(str(file.read()), labelmap)
+
+def get_labelname(labelmap, labels):
+    num_labels = len(labelmap.item)
+    labelnames = []
+    if type(labels) is not list:
+        labels = [labels]
+    for label in labels:
+        found = False
+        for i in xrange(0, num_labels):
+            if label == labelmap.item[i].label:
+                found = True
+                labelnames.append(labelmap.item[i].display_name)
+                break
+        assert found == True
+    return labelnames
+
+# SSD 500 with Egohands
+model_def = '/home/leejang/lib/ssd_caffe/caffe/models/VGGNet/hdi_detection/SSD_640x360/deploy.prototxt'
+model_weights = '/home/leejang/lib/ssd_caffe/caffe/models/VGGNet/hdi_detection/SSD_640x360/hdi_detection_SSD_640x360_iter_50000.caffemodel'
+
 
 class gesture_forecasting:
 
@@ -18,6 +70,19 @@ class gesture_forecasting:
      self.bridge = CvBridge()
      self.image_sub = rospy.Subscriber("/usb_cam/image_raw", Image, self.img_callback) 
      self.gesture_pub = rospy.Publisher("forecasting/gesture", String, queue_size=10)
+     self.lock = threading.Lock()
+     self.net = caffe.Net(model_def,      # defines the structure of the mode
+                          model_weights,  # contains the trained weights
+                          caffe.TEST)     # use test mode (e.g., don't perform dropout)
+
+     # input preprocessing: 'data' is the name of the input blob == net.inputs[0]
+     self.transformer = caffe.io.Transformer({'data': self.net.blobs['data'].data.shape})
+     self.transformer.set_transpose('data', (2, 0, 1))
+     self.transformer.set_mean('data', np.array([104,117,123])) # mean pixel
+     self.transformer.set_raw_scale('data', 255)  # the reference model operates on images in [0,255] range instead of [0,1]
+     self.transformer.set_channel_swap('data', (2,1,0))  # the reference model has channels in BGR order instead of RGB
+
+     self.soundhandle = SoundClient()
 
     def img_callback(self,data):
       try:
@@ -26,18 +91,85 @@ class gesture_forecasting:
         print e
 
       # write image
+      target_image = '/home/leejang/ros_ws/src/forecasting_gestures/cur_image/cur_image.jpg'
+      #cv2.imwrite(target_image, self.cv_image, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+      crop_img = self.cv_image[0:360, 0:640]
+      cv2.imwrite(target_image, crop_img, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
 
       #print('img_calback')
+      self.lock.acquire()
       self.do_gesture_forecasting();
+      self.lock.release()
 
     def do_gesture_forecasting(self):
-      #print('start gesture forecasting!')
-      #string = "come"
-      #string = "go"
-      #string = "stop"
-      #string = "selfie"
-      string = "go"
-      self.gesture_pub.publish(string)
+
+      caffe.set_device(0)
+      caffe.set_mode_gpu()
+
+      # processing time check
+      t = time.time()
+
+      print('start gesture forecasting!')
+
+      # resize (batch,dim,height,width)
+      #net.blobs['data'].reshape(1,3,360,640)
+
+      # load image
+      cur_image = '/home/leejang/ros_ws/src/forecasting_gestures/cur_image/cur_image.jpg'
+      image = caffe.io.load_image(cur_image)
+
+      transformed_image = self.transformer.preprocess('data', image)
+      self.net.blobs['data'].data[...] = transformed_image
+
+      # Forward pass.
+      detections = self.net.forward()['detection_out']
+
+      # Parse the outputs.
+      det_label = detections[0,0,:,1]
+      det_conf = detections[0,0,:,2]
+      det_xmin = detections[0,0,:,3]
+      det_ymin = detections[0,0,:,4]
+      det_xmax = detections[0,0,:,5]
+      det_ymax = detections[0,0,:,6]
+
+      # Get detections with confidence higher than 0.65.
+      top_indices = [i for i, conf in enumerate(det_conf) if conf >= 0.65]
+
+      top_conf = det_conf[top_indices]
+      top_label_indices = det_label[top_indices].tolist()
+      top_labels = get_labelname(labelmap, top_label_indices)
+      top_xmin = det_xmin[top_indices]
+      top_ymin = det_ymin[top_indices]
+      top_xmax = det_xmax[top_indices]
+      top_ymax = det_ymax[top_indices]
+
+      for i in xrange(top_conf.shape[0]):
+        xmin = int(round(top_xmin[i] * image.shape[1]))
+        ymin = int(round(top_ymin[i] * image.shape[0]))
+        xmax = int(round(top_xmax[i] * image.shape[1]))
+        ymax = int(round(top_ymax[i] * image.shape[0]))
+        score = top_conf[i]
+        label = int(top_label_indices[i])
+        label_name = top_labels[i]
+        print(" %s: %.2f" %(label_name, score))
+
+        text = ("%s: %.2f" %(label_name, score))
+        coords = xmin, ymin, xmax-xmin+1, ymax-ymin+1
+        centers = (xmin + xmax)/2, (ymin + ymax)/2
+
+        #string = "come"
+        #string = "go"
+        #string = "stop"
+        #string = "selfie"
+
+        # play sound 
+        self.soundhandle.say(label_name, voice, volume)
+        time.sleep(0.5)
+
+        # publish gesture topic
+        self.gesture_pub.publish(label_name)
+
+      print("Proesssed in {:.3f} seconds.".format(time.time() - t))
 
 def main(args):
     print 'initialize gesture forecasting node (python)'
