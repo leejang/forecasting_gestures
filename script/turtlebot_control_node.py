@@ -95,8 +95,11 @@ def getKey():
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
     return key
 
-speed = .2
-turn = 1
+# initial speed
+#speed = .2
+#turn = 1
+speed = .1
+turn = 0.5
 
 gb_key = ''
 #no_key_cnt = 0
